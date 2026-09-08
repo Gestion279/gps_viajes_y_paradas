@@ -1744,13 +1744,35 @@ async function insertRows(tabla, rows){
   return { insertados, total: rows.length, errores };
 }
 
+// Supabase/PostgREST devuelve como máximo 1000 filas por consulta, sin
+// importar cuántas haya en la tabla. Si se pide todo de una sola vez y
+// se ordena por 'inicio' ascendente, al superar las 1000 filas totales
+// el resto (los meses más nuevos) queda afuera silenciosamente y solo
+// se ve el tramo más viejo cargado (por eso aparecía únicamente mayo
+// al sumar junio/julio/agosto). Acá se pagina con .range() hasta traer
+// la tabla completa.
+const FETCH_PAGE_SIZE = 1000;
+
 async function fetchAllRows(tabla){
-  const { data, error } = await supa.from(tabla).select('*').order('inicio', { ascending: true });
-  if(error){
-    console.error(`Error al leer ${tabla} desde Supabase:`, error);
-    return [];
+  const allRows = [];
+  let from = 0;
+  while(true){
+    const to = from + FETCH_PAGE_SIZE - 1;
+    const { data, error } = await supa
+      .from(tabla)
+      .select('*')
+      .order('inicio', { ascending: true })
+      .range(from, to);
+    if(error){
+      console.error(`Error al leer ${tabla} desde Supabase:`, error);
+      break;
+    }
+    if(!data || data.length === 0) break;
+    allRows.push(...data);
+    if(data.length < FETCH_PAGE_SIZE) break; // última página
+    from += FETCH_PAGE_SIZE;
   }
-  return data || [];
+  return allRows;
 }
 
 async function fetchVehiculosLabelMap(){
