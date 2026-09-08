@@ -1,0 +1,17 @@
+{
+  "name": "Flota GPS — Panel de Viajes y Paradas",
+  "short_name": "Flota GPS",
+  "description": "Panel de monitoreo de flota: viajes y paradas a partir de los reportes GPS.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b1b2e",
+  "theme_color": "#123a63",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
