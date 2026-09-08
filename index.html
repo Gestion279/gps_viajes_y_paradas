@@ -895,6 +895,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
     <button class="icon-btn primary" id="btnExport" disabled title="Descarga un resumen en Excel, aplicando los filtros activos (Dispositivo, Grupo, Geo-Zona, Mes y Año, Días, Período y Horas)">Descargar resumen (.xlsx)</button>
     <button class="icon-btn primary" id="btnExportPdf" disabled title="Descarga un informe en PDF con todas las hojas del panel (Resumen, Vehículos, Regiones, Geo-Zonas, Históricos, Pernotes y Clientes), aplicando los filtros activos, para auditoría y toma de decisiones">Descargar informe (.pdf)</button>
+    <button class="icon-btn primary" id="btnGuardar" disabled title="Descarga una copia de este panel con los datos y los filtros actualmente elegidos ya fijados: se abre siempre así, sin depender de la conexión a Supabase">Guardar vista (.html)</button>
   </div>
 </header>
 
@@ -1490,6 +1491,7 @@ const state = {
   vehicles: new Map(),   // key -> vehicle object
   regions: new Map(),    // region -> aggregated object
   duplicateStats: null,  // { viajes, paradas } — registros omitidos por duplicado en la última carga
+  snapshotInfo: null,    // { savedAt } — si el archivo abierto es una "vista guardada", no viene de Supabase
   periodDays: 29.4,
   periodLabel: '',
   dataDateRange: null,   // {min:Date, max:Date} — rango real de fechas en los datos cargados
@@ -1540,6 +1542,7 @@ const els = {
   labelUpload: document.getElementById('labelUpload'),
   btnExport: document.getElementById('btnExport'),
   btnExportPdf: document.getElementById('btnExportPdf'),
+  btnGuardar: document.getElementById('btnGuardar'),
   emptyState: document.getElementById('emptyState'),
   dashboardContent: document.getElementById('dashboardContent'),
   statusInfo: document.getElementById('statusInfo'),
@@ -1682,8 +1685,8 @@ function detectWorkbookType(wb){
    Mientras diga "TU-PROYECTO" el panel no va a poder cargar ni
    guardar nada, y lo va a avisar en la barra de carga.
    ============================================================ */
-const SUPABASE_URL = 'https://oixzkvkybqexvrzwzwis.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9peHprdmt5YnFleHZyend6d2lzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NTUxNzEsImV4cCI6MjEwNDQzMTE3MX0.BTghtY8mZkyrK2y-kZXMb1aIecptX3OHOpNFqUBMzP4';
+const SUPABASE_URL = 'https://TU-PROYECTO.supabase.co';
+const SUPABASE_ANON_KEY = 'TU-ANON-KEY-PUBLICA';
 
 const supa = (typeof window.supabase !== 'undefined' && SUPABASE_URL.indexOf('TU-PROYECTO') === -1)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -4349,6 +4352,7 @@ function renderDashboardFromLoadedData(){
     els.dashboardContent.style.display = 'none';
     els.btnExport.disabled = true;
     els.btnExportPdf.disabled = true;
+    els.btnGuardar.disabled = true;
     return;
   }
   // computeDataRanges() debe correr ANTES de buildAggregates(): ésta última
@@ -4370,10 +4374,13 @@ function renderDashboardFromLoadedData(){
   filterGeozona.updateBadge();
   filterMesAnio.updateBadge();
   filterDias.updateBadge();
+  updatePeriodoBadge();
+  updateHorasBadge();
   els.emptyState.style.display = 'none';
   els.dashboardContent.style.display = 'block';
   els.btnExport.disabled = false;
   els.btnExportPdf.disabled = false;
+  els.btnGuardar.disabled = false;
   renderAll();
 }
 
@@ -4382,6 +4389,7 @@ function renderDashboardFromLoadedData(){
 // state.vehicles y vuelve a dibujar el panel. Es la fuente de verdad:
 // se llama tanto al abrir la página como después de cada carga nueva.
 async function loadAllFromSupabaseAndRender(){
+  state.snapshotInfo = null;
   if(!supabaseListo()){
     updateUploadStatus(false);
     return;
@@ -4396,10 +4404,160 @@ async function loadAllFromSupabaseAndRender(){
   updateUploadStatus(false);
 }
 
+/* ============================================================
+   GUARDAR VISTA (.html) — datos + filtros actuales, ya fijos
+   Genera una copia de este mismo panel con TODO lo que hay
+   cargado en pantalla en ese momento (los vehículos, viajes y
+   paradas ya traídos de Supabase) más los filtros que estén
+   elegidos, incrustados como datos fijos. Al abrir ese archivo
+   .html, el panel se ve exactamente igual, sin conectarse a
+   Supabase ni depender de que los datos sigan estando ahí.
+   ============================================================ */
+
+// Convierte un evento (viaje o parada) a un objeto que se puede guardar
+// como JSON: las fechas (objetos Date) se pasan a texto ISO.
+function serializeEventForSnapshot(ev){
+  const out = Object.assign({}, ev);
+  if(out.inicio instanceof Date) out.inicio = out.inicio.toISOString();
+  if(out.fin instanceof Date) out.fin = out.fin.toISOString();
+  return out;
+}
+
+// Reconstruye un evento guardado en un snapshot: el texto ISO vuelve a
+// ser un objeto Date, igual que cuando los datos vienen de Supabase.
+function deserializeEventFromSnapshot(ev){
+  const out = Object.assign({}, ev);
+  if(out.inicio) out.inicio = new Date(out.inicio);
+  if(out.fin) out.fin = new Date(out.fin);
+  return out;
+}
+
+function serializeVehiclesForSnapshot(){
+  return Array.from(state.vehicles.entries()).map(([key, v])=>({
+    key,
+    label: v.label,
+    region: v.region,
+    periodo: v.periodo,
+    trips: v.trips.map(serializeEventForSnapshot),
+    stops: v.stops.map(serializeEventForSnapshot)
+  }));
+}
+
+function applyVehiclesFromSnapshot(list){
+  state.vehicles.clear();
+  (list || []).forEach(v=>{
+    state.vehicles.set(v.key, {
+      key: v.key,
+      label: v.label,
+      region: v.region,
+      periodo: v.periodo || '',
+      trips: (v.trips || []).map(deserializeEventFromSnapshot),
+      stops: (v.stops || []).map(deserializeEventFromSnapshot)
+    });
+  });
+}
+
+// Los filtros usan Set (para elegir varios dispositivos/meses/días a la
+// vez) y Date (para el rango "personalizado"): ninguno de los dos se
+// puede guardar tal cual en JSON, así que se convierten a Array/ISO acá,
+// y se reconstruyen igual al abrir el archivo guardado.
+function serializeFiltersForSnapshot(){
+  const f = state.filters;
+  return {
+    dispositivos: Array.from(f.dispositivos),
+    grupos: Array.from(f.grupos),
+    geozonas: Array.from(f.geozonas),
+    mesAnio: Array.from(f.mesAnio),
+    dias: Array.from(f.dias),
+    periodoTipo: f.periodoTipo,
+    desde: f.desde instanceof Date ? f.desde.toISOString() : null,
+    hasta: f.hasta instanceof Date ? f.hasta.toISOString() : null,
+    horaTipo: f.horaTipo,
+    horaDesde: f.horaDesde,
+    horaHasta: f.horaHasta
+  };
+}
+
+function applyFiltersFromSnapshot(f){
+  if(!f) return;
+  state.filters.dispositivos = new Set(f.dispositivos || []);
+  state.filters.grupos = new Set(f.grupos || []);
+  state.filters.geozonas = new Set(f.geozonas || []);
+  state.filters.mesAnio = new Set(f.mesAnio || []);
+  state.filters.dias = new Set(f.dias || []);
+  state.filters.periodoTipo = f.periodoTipo || 'todo';
+  state.filters.desde = f.desde ? new Date(f.desde) : null;
+  state.filters.hasta = f.hasta ? new Date(f.hasta) : null;
+  state.filters.horaTipo = f.horaTipo || 'todo';
+  state.filters.horaDesde = (typeof f.horaDesde === 'number') ? f.horaDesde : 8;
+  state.filters.horaHasta = (typeof f.horaHasta === 'number') ? f.horaHasta : 17;
+}
+
+// Arma el HTML completo a descargar: una copia de este documento con un
+// <script> nuevo, insertado justo después de <head>, que deja los datos
+// y los filtros de este momento en window.__EMBEDDED_SNAPSHOT__. Esa
+// variable se revisa al arrancar el panel (ver el final del script
+// principal): si está presente, el panel arranca desde ahí en vez de
+// conectarse a Supabase.
+function buildSnapshotHtml(){
+  const snapshot = {
+    savedAt: new Date().toISOString(),
+    vehicles: serializeVehiclesForSnapshot(),
+    filters: serializeFiltersForSnapshot()
+  };
+  const fullHtml = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+  const snapshotScript = '<script>window.__EMBEDDED_SNAPSHOT__ = '
+    + JSON.stringify(snapshot) + ';<' + '/script>\n';
+  const headCloseIdx = fullHtml.indexOf('</head>');
+  if(headCloseIdx === -1){
+    throw new Error('No se encontró la etiqueta </head> para incrustar la vista guardada.');
+  }
+  return fullHtml.slice(0, headCloseIdx) + snapshotScript + fullHtml.slice(headCloseIdx);
+}
+
+function saveCurrentViewAsHtml(){
+  try{
+    if(state.vehicles.size === 0){
+      alert('Todavía no hay datos cargados para guardar.');
+      return;
+    }
+    const html = buildSnapshotHtml();
+    const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date();
+    const pad = n=>String(n).padStart(2,'0');
+    const nombre = 'Flota_GPS_vista_' + stamp.getFullYear() + pad(stamp.getMonth()+1) + pad(stamp.getDate())
+      + '_' + pad(stamp.getHours()) + pad(stamp.getMinutes()) + '.html';
+    a.href = url;
+    a.download = nombre;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 4000);
+  } catch(e){
+    console.error(e);
+    alert('No se pudo guardar la vista: ' + e.message);
+  }
+}
+
+els.btnGuardar.addEventListener('click', saveCurrentViewAsHtml);
+
 // Muestra el estado actual (cuántos vehículos hay cargados y, si
 // corresponde, cuántos registros se omitieron por duplicados en la
 // última carga) en la barra superior.
 function updateUploadStatus(){
+  if(state.snapshotInfo){
+    const fecha = new Date(state.snapshotInfo.savedAt);
+    const fechaTexto = fmtFullDateTimeEs(fecha);
+    const totalVehiculos = state.vehicles.size;
+    const text = `Vista guardada el ${fechaTexto} · ${totalVehiculos} vehículo${totalVehiculos===1?'':'s'} (datos y filtros fijos de ese momento)`;
+    els.labelUpload.textContent = text;
+    els.labelUpload.title = text;
+    els.dotUpload.classList.add('ok');
+    els.dotUpload.classList.remove('pending');
+    return;
+  }
   if(!supa){
     const msg = 'Supabase no está configurado (completá SUPABASE_URL y SUPABASE_ANON_KEY en el HTML)';
     els.labelUpload.textContent = msg;
@@ -5004,11 +5162,24 @@ els.geoSearch.addEventListener('input', function(){
 els.btnExport.addEventListener('click', exportSummary);
 els.btnExportPdf.addEventListener('click', exportPdfReport);
 
-// Al abrir el dashboard, muestra el estado inicial y trae todo lo que
-// haya guardado en Supabase (de cualquier persona que haya cargado
-// reportes antes, desde cualquier dispositivo).
-updateUploadStatus();
-loadAllFromSupabaseAndRender();
+// Al abrir el dashboard: si este mismo archivo es una "vista guardada"
+// (ver saveCurrentViewAsHtml / botón "Guardar vista"), arranca desde ahí,
+// con los datos y los filtros ya fijados, sin tocar Supabase. Si no,
+// funciona como siempre: trae todo lo que haya guardado en Supabase.
+function startApp(){
+  if(window.__EMBEDDED_SNAPSHOT__){
+    const snap = window.__EMBEDDED_SNAPSHOT__;
+    applyVehiclesFromSnapshot(snap.vehicles);
+    applyFiltersFromSnapshot(snap.filters);
+    state.snapshotInfo = { savedAt: snap.savedAt };
+    renderDashboardFromLoadedData();
+    updateUploadStatus();
+    return;
+  }
+  updateUploadStatus();
+  loadAllFromSupabaseAndRender();
+}
+startApp();
 
 // Exposición para depuración/testing (no afecta el funcionamiento normal).
 window.renderHistoricosTab = renderHistoricosTab;

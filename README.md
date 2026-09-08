@@ -45,6 +45,19 @@ no es el secreto de esa clave, sino las políticas de RLS que ya vienen
 en `supabase_schema.sql`: permiten leer y cargar, pero no borrar ni
 editar lo que subió otra persona.
 
+## Botón "Guardar vista (.html)"
+
+Descarga una copia de este mismo panel con los datos y los filtros que
+estén elegidos en ese momento ya fijos adentro del archivo. Sirve para
+mandar por correo o archivar una foto exacta de lo que se estaba viendo
+(por ejemplo, el cierre de un mes), sin que dependa de que los datos
+sigan estando en Supabase ni de tener conexión a internet para abrirla.
+
+Al abrir ese archivo descargado, el panel arranca directamente con esos
+datos y esos filtros — no se conecta a Supabase. Si desde ahí se sube un
+reporte nuevo, ese archivo vuelve a comportarse como el panel en vivo
+(guarda en Supabase y trae los datos actualizados).
+
 ## Publicarlo (Vercel o GitHub Pages)
 
 **Si ya tenés el repo conectado a Vercel** (como en este caso): no hay
