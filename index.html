@@ -1491,6 +1491,7 @@ const state = {
   vehicles: new Map(),   // key -> vehicle object
   regions: new Map(),    // region -> aggregated object
   duplicateStats: null,  // { viajes, paradas } — registros omitidos por duplicado en la última carga
+  lastUploadError: null, // texto del último error real de Supabase (no confundir con duplicados)
   snapshotInfo: null,    // { savedAt } — si el archivo abierto es una "vista guardada", no viene de Supabase
   periodDays: 29.4,
   periodLabel: '',
@@ -1685,8 +1686,8 @@ function detectWorkbookType(wb){
    Mientras diga "TU-PROYECTO" el panel no va a poder cargar ni
    guardar nada, y lo va a avisar en la barra de carga.
    ============================================================ */
-const SUPABASE_URL = 'https://oixzkvkybqexvrzwzwis.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9peHprdmt5YnFleHZyend6d2lzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NTUxNzEsImV4cCI6MjEwNDQzMTE3MX0.BTghtY8mZkyrK2y-kZXMb1aIecptX3OHOpNFqUBMzP4';
+const SUPABASE_URL = 'https://TU-PROYECTO.supabase.co';
+const SUPABASE_ANON_KEY = 'TU-ANON-KEY-PUBLICA';
 
 const supa = (typeof window.supabase !== 'undefined' && SUPABASE_URL.indexOf('TU-PROYECTO') === -1)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -1704,9 +1705,10 @@ function supabaseListo(){
 // subidos. No es bloqueante para la carga de viajes/paradas si falla.
 async function upsertVehiculos(vehiculosMap){
   const rows = Array.from(vehiculosMap.values());
-  if(!rows.length) return;
+  if(!rows.length) return { error: null };
   const { error } = await supa.from('vehiculos').upsert(rows, { onConflict: 'dominio' });
   if(error) console.error('Error al guardar vehículos en Supabase:', error);
+  return { error };
 }
 
 // Inserta filas nuevas en 'viajes' o 'paradas'. La tabla tiene una
@@ -1714,17 +1716,32 @@ async function upsertVehiculos(vehiculosMap){
 // vehículo, mismo instante exacto de inicio), Supabase la descarta sola
 // —"ignoreDuplicates"—, sin que el navegador tenga que saber de antemano
 // qué había cargado otra persona desde otro dispositivo.
+// Se sube de a lotes (en vez de todo junto) para no chocar con el límite
+// de tamaño de pedido de Supabase cuando un reporte trae miles de filas
+// (por ejemplo, un mes completo con 80+ vehículos). Devuelve cuántas se
+// insertaron realmente y, si algo falló, el/los errores por separado —
+// así un error real de Supabase nunca se muestra como si fueran
+// "duplicados", que es lo que pasaba antes.
+const INSERT_CHUNK_SIZE = 500;
+
 async function insertRows(tabla, rows){
-  if(!rows.length) return { insertados: 0, total: 0 };
-  const { data, error } = await supa
-    .from(tabla)
-    .upsert(rows, { onConflict: 'dominio,inicio', ignoreDuplicates: true })
-    .select('id');
-  if(error){
-    console.error(`Error al guardar ${tabla} en Supabase:`, error);
-    return { insertados: 0, total: rows.length, error };
+  if(!rows.length) return { insertados: 0, total: 0, errores: [] };
+  let insertados = 0;
+  const errores = [];
+  for(let i=0; i<rows.length; i+=INSERT_CHUNK_SIZE){
+    const chunk = rows.slice(i, i+INSERT_CHUNK_SIZE);
+    const { data, error } = await supa
+      .from(tabla)
+      .upsert(chunk, { onConflict: 'dominio,inicio', ignoreDuplicates: true })
+      .select('id');
+    if(error){
+      console.error(`Error al guardar ${tabla} en Supabase (filas ${i}-${i+chunk.length}):`, error);
+      errores.push(error);
+      continue;
+    }
+    insertados += (data || []).length;
   }
-  return { insertados: (data || []).length, total: rows.length };
+  return { insertados, total: rows.length, errores };
 }
 
 async function fetchAllRows(tabla){
@@ -4580,6 +4597,9 @@ function updateUploadStatus(){
     if(dup.paradas) partes.push(`${dup.paradas} parada${dup.paradas===1?'':'s'}`);
     text += ` · Se omitieron ${partes.join(' y ')} duplicados (ya estaban cargados)`;
   }
+  if(state.lastUploadError){
+    text += ` · ⚠ Error al guardar en Supabase: ${state.lastUploadError}`;
+  }
   els.labelUpload.textContent = text;
   els.labelUpload.title = text;
   const ready = totalVehiculos > 0;
@@ -4620,15 +4640,36 @@ els.fileUpload.addEventListener('change', function(e){
         }
       });
 
-      await upsertVehiculos(vehiculosMap);
+      const vehiculosRes = await upsertVehiculos(vehiculosMap);
+      if(vehiculosRes.error){
+        // Si falla acá, viajes/paradas van a fallar también (dependen del
+        // vehículo ya guardado), así que no seguimos y mostramos el error real.
+        state.lastUploadError = vehiculosRes.error.message || 'Error desconocido al guardar los vehículos en Supabase';
+        state.duplicateStats = null;
+        els.fileUpload.value = '';
+        updateUploadStatus();
+        return;
+      }
+
       const [resViajes, resParadas] = await Promise.all([
         insertRows('viajes', viajesRows),
         insertRows('paradas', paradasRows)
       ]);
-      state.duplicateStats = {
-        viajes: resViajes.total - resViajes.insertados,
-        paradas: resParadas.total - resParadas.insertados
-      };
+
+      const erroresTotales = [...resViajes.errores, ...resParadas.errores];
+      if(erroresTotales.length){
+        // Hubo un error real al guardar (no confundir con duplicados): se
+        // muestra tal cual lo devuelve Supabase, para poder diagnosticarlo.
+        const primerError = erroresTotales[0];
+        state.lastUploadError = (primerError && primerError.message) || 'Error desconocido al guardar en Supabase';
+        state.duplicateStats = null;
+      } else {
+        state.lastUploadError = null;
+        state.duplicateStats = {
+          viajes: resViajes.total - resViajes.insertados,
+          paradas: resParadas.total - resParadas.insertados
+        };
+      }
 
       els.fileUpload.value = '';
       await loadAllFromSupabaseAndRender();
