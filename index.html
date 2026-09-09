@@ -875,6 +875,65 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible{
     outline: 2px solid var(--accent-blue-2); outline-offset:2px;
   }
+
+  /* ============================================================
+     RESPONSIVE — CELULAR
+     Todo lo que sigue vive dentro de @media (max-width: 760px), así
+     que la versión de escritorio queda exactamente igual que antes.
+     ============================================================ */
+  @media (max-width: 760px){
+    header.topbar{ padding: 14px 14px 12px 14px; gap:10px; }
+    .brand{ min-width:0; width:100%; }
+    .brand h1{ font-size:18px; }
+    .route-track{ width:140px; }
+    .toolbar{ width:100%; gap:8px; }
+    .toolbar .upload-btn, .toolbar .icon-btn{
+      flex:1 1 100%; justify-content:center; font-size:12.5px; padding:9px 10px;
+    }
+
+    main{ padding: 14px 12px 40px 12px; }
+
+    .filter-bar{ gap:8px; margin-top:14px; }
+    .filter-dropdown{ flex:1 1 calc(50% - 8px); min-width:0; }
+    .filter-btn{
+      width:100%; justify-content:space-between; padding:9px 10px; font-size:12.5px;
+    }
+    #btnClearFilters{ flex:1 1 100%; justify-content:center; }
+    .filter-panel, .period-panel{
+      position:fixed; left:12px; right:12px; top:90px; bottom:auto; width:auto; max-width:none;
+      max-height:calc(100vh - 110px); overflow:auto;
+    }
+    .date-popup{ left:auto; right:0; width:230px; }
+
+    .kpi-row, .kpi-row.six{ grid-template-columns: 1fr 1fr; gap:10px; margin-top:14px; }
+    .kpi-card{ padding:12px 14px; }
+    .kpi-card .value{ font-size:22px; }
+
+    .grid-row{ gap:12px; margin-top:12px; }
+    .grid-row.two, .grid-row.two-rev, .grid-row.three{ grid-template-columns: 1fr; }
+
+    .panel{ padding:14px; }
+
+    /* Las pestañas (Resumen / Geo-Zonas / Históricos / ...) no entran
+       todas en el ancho de un celular: en vez de desbordar la página
+       entera, ahora se deslizan horizontalmente dentro de su propia
+       franja, con la pestaña activa siempre visible. */
+    .view-tabs{
+      flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
+      margin-top:14px; padding-bottom:2px; scrollbar-width:thin;
+    }
+    .view-tab{
+      flex:none; padding:10px 14px; font-size:12.5px; white-space:nowrap;
+    }
+
+    #geoMap, #resumenMap, #historicosMap, #pernoteMap{ height:260px; }
+    #clientesMap{ height:300px; }
+
+    table.data-table{ font-size:12px; }
+    table.data-table th, table.data-table td{ padding:7px 8px; }
+
+    footer.statusbar{ font-size:11px; gap:6px; }
+  }
 </style>
 </head>
 <body>
@@ -1509,6 +1568,11 @@ const state = {
   lastGeoVehicles: [],
   lastFilteredVehicles: [],
   currentView: 'resumen',
+  // Render bajo demanda: guarda qué pestañas ya están dibujadas con el
+  // juego de filtros actual. Se vacía en cada renderAll() (cambio de
+  // filtros/datos) y se va completando a medida que el usuario visita
+  // cada pestaña, para no recalcular ni redibujar las que no mira.
+  renderedTabs: new Set(),
   allGeoZonas: [],
   allMesAnio: [],
   clientesFiltro: 'todos',       // 'todos' | 'telefonica' | 'claro' | 'arsat'
@@ -1754,23 +1818,42 @@ async function insertRows(tabla, rows){
 const FETCH_PAGE_SIZE = 1000;
 
 async function fetchAllRows(tabla){
-  const allRows = [];
-  let from = 0;
-  while(true){
+  // Primero se pide el total de filas (sin traer los datos, con head:true)
+  // para saber cuántas tandas de FETCH_PAGE_SIZE hacen falta, y después se
+  // piden todas esas tandas EN PARALELO con Promise.all, en vez de una por
+  // una esperando cada respuesta antes de pedir la siguiente. Con varios
+  // miles de filas esto reduce la carga de varios viajes de ida y vuelta
+  // en serie a uno solo (en paralelo).
+  const { count, error: countError } = await supa
+    .from(tabla)
+    .select('*', { count: 'exact', head: true });
+
+  if(countError){
+    console.error(`Error al contar filas de ${tabla} en Supabase:`, countError);
+    return [];
+  }
+
+  const total = count || 0;
+  if(total === 0) return [];
+
+  const pageCount = Math.ceil(total / FETCH_PAGE_SIZE);
+  const pagePromises = [];
+  for(let i = 0; i < pageCount; i++){
+    const from = i * FETCH_PAGE_SIZE;
     const to = from + FETCH_PAGE_SIZE - 1;
-    const { data, error } = await supa
-      .from(tabla)
-      .select('*')
-      .order('inicio', { ascending: true })
-      .range(from, to);
+    pagePromises.push(
+      supa.from(tabla).select('*').order('inicio', { ascending: true }).range(from, to)
+    );
+  }
+
+  const results = await Promise.all(pagePromises);
+  const allRows = [];
+  for(const { data, error } of results){
     if(error){
       console.error(`Error al leer ${tabla} desde Supabase:`, error);
-      break;
+      continue;
     }
-    if(!data || data.length === 0) break;
-    allRows.push(...data);
-    if(data.length < FETCH_PAGE_SIZE) break; // última página
-    from += FETCH_PAGE_SIZE;
+    if(data) allRows.push(...data);
   }
   return allRows;
 }
@@ -3880,19 +3963,46 @@ function renderClientesTab(){
   if(state.currentView === 'clientes') renderClientesMap(geoStats);
 }
 
+// Dibuja (si hace falta) el contenido de la pestaña actualmente activa.
+// "Si hace falta" = todavía no se dibujó con el juego de filtros vigente
+// (renderAll() vacía renderedTabs cada vez que cambian filtros o datos).
+// Esto evita recalcular y volver a pintar tablas/gráficos/mapas de
+// pestañas que el usuario no está mirando en este momento.
+function renderActiveTab(){
+  const view = state.currentView;
+  if(state.renderedTabs.has(view)) return;
+  const vehicles = state.lastFilteredVehicles || [];
+  switch(view){
+    case 'resumen':
+      renderKPIs(vehicles);
+      renderRegionKmChart(vehicles);
+      renderViajesDiaChart(vehicles);
+      renderRegionTable(vehicles);
+      renderAnomalyTable(vehicles);
+      renderResumenMap(vehicles);
+      break;
+    case 'geozonas':
+      renderGeoZonasTab(vehicles);
+      break;
+    case 'historicos':
+      renderHistoricosTab(vehicles);
+      break;
+    case 'clientes':
+      renderClientesTab();
+      break;
+    case 'pernotes':
+      renderPernotesTab(vehicles);
+      break;
+  }
+  state.renderedTabs.add(view);
+}
+
 function renderAll(){
   const vehicles = filteredVehicles();
   state.lastFilteredVehicles = vehicles;
-  renderKPIs(vehicles);
-  renderRegionKmChart(vehicles);
-  renderViajesDiaChart(vehicles);
-  renderRegionTable(vehicles);
-  renderAnomalyTable(vehicles);
-  if(state.currentView === 'resumen') renderResumenMap(vehicles);
-  renderGeoZonasTab(vehicles);
-  renderHistoricosTab(vehicles);
-  renderClientesTab();
-  renderPernotesTab(vehicles);
+  // Cambiaron los filtros o los datos: lo ya dibujado quedó viejo.
+  state.renderedTabs = new Set();
+  renderActiveTab();
 
   document.getElementById('statusInfo').textContent =
     `${state.vehicles.size} vehículos · período ${state.periodLabel || '—'} (${fmtNum(state.periodDays,1)} días)`;
@@ -4711,13 +4821,19 @@ document.querySelectorAll('.view-tab').forEach(function(btn){
     state.currentView = view;
     const panelId = view==='resumen' ? 'viewResumen' : (view==='geozonas' ? 'viewGeozonas' : (view==='historicos' ? 'viewHistoricos' : (view==='pernotes' ? 'viewPernotes' : 'viewClientes')));
     document.getElementById(panelId).classList.add('active');
+
+    // Si esta pestaña todavía no se dibujó con los filtros actuales
+    // (primera visita, o volvió a quedar "sucia" por un cambio de
+    // filtro mientras el usuario miraba otra pestaña), se calcula y
+    // dibuja recién ahora.
+    renderActiveTab();
+
     if(view==='geozonas'){
       ensureGeoMap();
       renderGeoMap(state.lastGeoVehicles, state.lastGeoRows);
       setTimeout(function(){ if(state.geoMap) state.geoMap.invalidateSize(); }, 60);
     }
     if(view==='historicos'){
-      renderHistoricosTab(state.lastFilteredVehicles || []);
       setTimeout(function(){ if(state.historicosMap) state.historicosMap.invalidateSize(); }, 60);
     }
     if(view==='clientes'){
@@ -4730,7 +4846,6 @@ document.querySelectorAll('.view-tab').forEach(function(btn){
       setTimeout(function(){ if(state.pernoteMap) state.pernoteMap.invalidateSize(); }, 60);
     }
     if(view==='resumen'){
-      renderResumenMap(state.lastFilteredVehicles || []);
       setTimeout(function(){ if(state.resumenMap) state.resumenMap.invalidateSize(); }, 60);
     }
   });
