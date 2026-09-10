@@ -929,6 +929,22 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     #geoMap, #resumenMap, #historicosMap, #pernoteMap{ height:260px; }
     #clientesMap{ height:300px; }
 
+    /* Control de capas de Leaflet (base + Geo-Zonas/Recorridos GPS):
+       en celular arranca colapsado (un botón de capas) para no tapar
+       el mapa, y al tocarlo se despliega con tipografía más chica. */
+    .leaflet-control-layers{
+      font-size:12px;
+    }
+    .leaflet-control-layers-toggle{
+      width:34px; height:34px;
+    }
+    .leaflet-control-layers-expanded{
+      max-width:180px; padding:8px 10px;
+    }
+    .leaflet-control-layers-expanded label{
+      margin-bottom:4px;
+    }
+
     table.data-table{ font-size:12px; }
     table.data-table th, table.data-table td{ padding:7px 8px; }
 
@@ -2757,10 +2773,11 @@ function ensureGeoMap(){
   state.geoZonasLayer = L.layerGroup().addTo(state.geoMap);
   state.recorridosLayer = L.layerGroup().addTo(state.geoMap);
 
+  const isMobileGeoMap = window.matchMedia('(max-width: 760px)').matches;
   L.control.layers(
     { 'OpenStreetMap': osm, 'Esri World Imagery': esri, 'OpenTopoMap': topo },
     { 'Geo-Zonas': state.geoZonasLayer, 'Recorridos GPS': state.recorridosLayer },
-    { collapsed: false }
+    { collapsed: isMobileGeoMap }
   ).addTo(state.geoMap);
 
   attachMeasureTool(state.geoMap, () => [state.geoZonasLayer, state.recorridosLayer]);
