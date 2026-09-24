@@ -15,10 +15,10 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Flota GPS">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!-- XLSX (SheetJS) ya no se carga al abrir: se descarga recién al subir o exportar (ver ensureXLSX). -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script>
+<script type="text/x-lazy-js" id="lazy-jspdf">
 /* jsPDF v2.5.1 — incrustado localmente para que el informe en PDF funcione
    sin depender de una red externa (evita bloqueos de firewall/antivirus/CDN). */
 /** @license
@@ -421,7 +421,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 //# sourceMappingURL=jspdf.umd.min.js.map
 
 </script>
-<script>
+<script type="text/x-lazy-js" id="lazy-jspdf-autotable">
 /* jsPDF-AutoTable v3.8.2 — incrustado localmente por el mismo motivo. */
 /*!
  * 
@@ -1557,8 +1557,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 'use strict';
 
 /* ============================================================
-   ESTADO EN MEMORIA (nada se guarda en el navegador: todo vive
-   en estas variables mientras la pestaña está abierta)
+   ESTADO EN MEMORIA (los datos viven en estas variables; además se
+   guarda en el navegador una copia de los datos y de los últimos
+   filtros para abrir más rápido — ver "CACHÉ LOCAL")
    ============================================================ */
 
 
@@ -1567,6 +1568,7 @@ const state = {
   regions: new Map(),    // region -> aggregated object
   duplicateStats: null,  // { viajes, paradas } — registros omitidos por duplicado en la última carga
   lastUploadError: null, // texto del último error real de Supabase (no confundir con duplicados)
+  cacheNote: null,       // texto sobre la copia local (caché) que se está mostrando, o null
   snapshotInfo: null,    // { savedAt } — si el archivo abierto es una "vista guardada", no viene de Supabase
   periodDays: 29.4,
   periodLabel: '',
@@ -1740,6 +1742,39 @@ function fmtHours(minutes){
 /* ============================================================
    LECTURA DE WORKBOOKS
    ============================================================ */
+/* ============================================================
+   LIBRERÍAS BAJO DEMANDA
+   XLSX (lectura/escritura de Excel) y jsPDF (informe PDF) no se
+   usan al abrir el panel: se cargan recién cuando hacen falta.
+   ============================================================ */
+let xlsxPromise = null;
+function ensureXLSX(){
+  if(window.XLSX) return Promise.resolve();
+  if(xlsxPromise) return xlsxPromise;
+  xlsxPromise = new Promise((resolve, reject)=>{
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    sc.onload = ()=>{ sc.remove(); resolve(); };
+    sc.onerror = ()=>{ sc.remove(); xlsxPromise = null; reject(new Error('No se pudo descargar la librería de Excel (XLSX). Verificá la conexión.')); };
+    document.head.appendChild(sc);
+  });
+  return xlsxPromise;
+}
+
+// jsPDF y AutoTable siguen incrustados en este archivo (funcionan sin red),
+// pero guardados como texto inerte: se ejecutan recién al pedir el PDF.
+function ensureJsPDF(){
+  if(window.jspdf && window.jspdf.jsPDF && window.jspdf.jsPDF.API && window.jspdf.jsPDF.API.autoTable) return;
+  ['lazy-jspdf', 'lazy-jspdf-autotable'].forEach(id=>{
+    const src = document.getElementById(id);
+    if(!src) return;
+    const sc = document.createElement('script');
+    sc.text = src.textContent;
+    document.head.appendChild(sc);   // se ejecuta en este momento
+    sc.remove();                     // no duplicar ~450 KB en "Guardar vista"
+  });
+}
+
 async function readWorkbook(file){
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, {type:'array'});
@@ -1833,24 +1868,33 @@ async function insertRows(tabla, rows){
 // la tabla completa.
 const FETCH_PAGE_SIZE = 1000;
 
-async function fetchAllRows(tabla){
-  // Primero se pide el total de filas (sin traer los datos, con head:true)
-  // para saber cuántas tandas de FETCH_PAGE_SIZE hacen falta, y después se
-  // piden todas esas tandas EN PARALELO con Promise.all, en vez de una por
-  // una esperando cada respuesta antes de pedir la siguiente. Con varios
-  // miles de filas esto reduce la carga de varios viajes de ida y vuelta
-  // en serie a uno solo (en paralelo).
-  const { count, error: countError } = await supa
+// Pide solo el total de filas (head:true: no trae datos, es muy liviano).
+// Devuelve null si hubo error (sin conexión, Supabase caído, etc.).
+async function fetchRowCount(tabla){
+  const { count, error } = await supa
     .from(tabla)
     .select('*', { count: 'exact', head: true });
-
-  if(countError){
-    console.error(`Error al contar filas de ${tabla} en Supabase:`, countError);
-    return [];
+  if(error){
+    console.error(`Error al contar filas de ${tabla} en Supabase:`, error);
+    return null;
   }
+  return count || 0;
+}
 
-  const total = count || 0;
-  if(total === 0) return [];
+// Trae la tabla completa en tandas de FETCH_PAGE_SIZE, todas en paralelo.
+// - Solo se piden las columnas que el panel usa (dominio, region, inicio,
+//   data): no viajan id, created_at ni ninguna otra columna extra.
+// - Se ordena por inicio Y dominio: la clave única es (dominio, inicio), así
+//   que el orden queda fijo entre una tanda y otra. Ordenando solo por
+//   'inicio', dos vehículos con el mismo instante de inicio podían quedar en
+//   distinto orden en cada consulta y una fila repetirse en dos tandas
+//   mientras otra no aparecía en ninguna.
+// Devuelve { rows, ok } — ok=false si alguna tanda falló (en ese caso el
+// resultado no se guarda en la caché local, para no dejar datos a medias).
+async function fetchAllRows(tabla, knownTotal){
+  const total = (typeof knownTotal === 'number') ? knownTotal : await fetchRowCount(tabla);
+  if(total === null) return { rows: [], ok: false };
+  if(total === 0) return { rows: [], ok: true };
 
   const pageCount = Math.ceil(total / FETCH_PAGE_SIZE);
   const pagePromises = [];
@@ -1858,27 +1902,33 @@ async function fetchAllRows(tabla){
     const from = i * FETCH_PAGE_SIZE;
     const to = from + FETCH_PAGE_SIZE - 1;
     pagePromises.push(
-      supa.from(tabla).select('*').order('inicio', { ascending: true }).range(from, to)
+      supa.from(tabla)
+        .select('dominio,region,inicio,data')
+        .order('inicio', { ascending: true })
+        .order('dominio', { ascending: true })
+        .range(from, to)
     );
   }
 
   const results = await Promise.all(pagePromises);
   const allRows = [];
+  let ok = true;
   for(const { data, error } of results){
     if(error){
       console.error(`Error al leer ${tabla} desde Supabase:`, error);
+      ok = false;
       continue;
     }
     if(data) allRows.push(...data);
   }
-  return allRows;
+  return { rows: allRows, ok };
 }
 
 async function fetchVehiculosLabelMap(){
   const { data, error } = await supa.from('vehiculos').select('dominio, label');
   if(error){
     console.error('Error al leer vehículos desde Supabase:', error);
-    return new Map();
+    return null;
   }
   const map = new Map();
   (data || []).forEach(v=>map.set(v.dominio, v.label));
@@ -4020,6 +4070,7 @@ function renderAll(){
   // Cambiaron los filtros o los datos: lo ya dibujado quedó viejo.
   state.renderedTabs = new Set();
   renderActiveTab();
+  saveLastFilters();
 
   document.getElementById('statusInfo').textContent =
     `${state.vehicles.size} vehículos · período ${state.periodLabel || '—'} (${fmtNum(state.periodDays,1)} días)`;
@@ -4535,6 +4586,7 @@ function renderDashboardFromLoadedData(){
   }
   state.allGeoZonas = buildGeoZoneStats(Array.from(state.vehicles.values()))
     .map(r=>({key:r.key, label:r.label}));
+  dropMissingFilterKeys();
   filterDispositivo.updateBadge();
   filterGrupo.updateBadge();
   filterGeozona.updateBadge();
@@ -4550,24 +4602,170 @@ function renderDashboardFromLoadedData(){
   renderAll();
 }
 
-// Trae TODO lo que haya guardado en Supabase (de cualquier persona que
-// haya subido reportes antes, desde cualquier dispositivo), reconstruye
-// state.vehicles y vuelve a dibujar el panel. Es la fuente de verdad:
-// se llama tanto al abrir la página como después de cada carga nueva.
+/* ============================================================
+   CACHÉ LOCAL (IndexedDB) + ÚLTIMOS FILTROS (localStorage)
+   Al abrir, el panel se dibuja al instante con la última copia de
+   los datos guardada en ESTE navegador y con los últimos filtros
+   usados. En paralelo le pregunta a Supabase cuántas filas hay
+   (consulta liviana, sin datos): si coincide con la copia local, no
+   descarga nada; si cambió (alguien subió reportes nuevos, desde
+   cualquier equipo), descarga todo de nuevo y redibuja.
+   Supabase sigue siendo la fuente de verdad: la caché es solo
+   una copia para no esperar la descarga completa en cada apertura.
+   ============================================================ */
+const CACHE_DB_NAME = 'flotaGpsCache';
+const CACHE_STORE = 'datos';
+const CACHE_KEY = 'ultimo';
+const CACHE_VERSION = 1;              // subir si cambia el formato de lo guardado
+const FILTERS_STORAGE_KEY = 'flotaGps.ultimosFiltros.v1';
+
+function cacheOpenDb(){
+  return new Promise((resolve, reject)=>{
+    if(!('indexedDB' in window)){ reject(new Error('IndexedDB no disponible')); return; }
+    const req = indexedDB.open(CACHE_DB_NAME, 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore(CACHE_STORE); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+
+async function cacheRead(){
+  try{
+    const db = await cacheOpenDb();
+    const value = await new Promise((resolve)=>{
+      const tx = db.transaction(CACHE_STORE, 'readonly');
+      const r = tx.objectStore(CACHE_STORE).get(CACHE_KEY);
+      r.onsuccess = ()=>resolve(r.result || null);
+      r.onerror = ()=>resolve(null);
+    });
+    db.close();
+    if(!value || value.version !== CACHE_VERSION || value.supabaseUrl !== SUPABASE_URL) return null;
+    return value;
+  } catch(e){
+    console.warn('No se pudo leer la caché local:', e);
+    return null;
+  }
+}
+
+async function cacheWrite(value){
+  try{
+    const db = await cacheOpenDb();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction(CACHE_STORE, 'readwrite');
+      tx.objectStore(CACHE_STORE).put(value, CACHE_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = ()=>reject(tx.error);
+      tx.onabort = ()=>reject(tx.error);
+    });
+    db.close();
+  } catch(e){
+    // Si no hay espacio o el navegador lo bloquea, el panel sigue igual
+    // que antes (solo que la próxima apertura vuelve a descargar todo).
+    console.warn('No se pudo guardar la caché local:', e);
+  }
+}
+
+function saveLastFilters(){
+  if(state.snapshotInfo) return; // una "vista guardada" no pisa los filtros del uso normal
+  try{ localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(serializeFiltersForSnapshot())); }
+  catch(e){ /* navegador sin almacenamiento: se ignora */ }
+}
+
+function restoreLastFilters(){
+  try{
+    const raw = localStorage.getItem(FILTERS_STORAGE_KEY);
+    if(raw) applyFiltersFromSnapshot(JSON.parse(raw));
+  } catch(e){ /* dato corrupto o sin almacenamiento: se arranca sin filtros */ }
+}
+
+// Quita de los filtros restaurados lo que ya no existe en los datos
+// (por ej. un vehículo que se dio de baja), para no terminar con un
+// panel vacío por una selección vieja.
+function dropMissingFilterKeys(){
+  const f = state.filters;
+  Array.from(f.dispositivos).forEach(k=>{ if(!state.vehicles.has(k)) f.dispositivos.delete(k); });
+  Array.from(f.grupos).forEach(k=>{ if(!state.regions.has(k)) f.grupos.delete(k); });
+  const geoKeys = new Set(state.allGeoZonas.map(g=>g.key));
+  Array.from(f.geozonas).forEach(k=>{ if(!geoKeys.has(k)) f.geozonas.delete(k); });
+}
+
+function labelMapSignature(map){
+  return JSON.stringify(Array.from(map.entries()).sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0));
+}
+
+// Trae de Supabase lo necesario, reconstruye state.vehicles y vuelve a
+// dibujar el panel. Se llama al abrir la página y después de cada carga
+// nueva. Si hay una copia local, primero dibuja desde ahí (instantáneo) y
+// solo descarga todo cuando Supabase tiene filas que la copia no tiene.
 async function loadAllFromSupabaseAndRender(){
   state.snapshotInfo = null;
   if(!supabaseListo()){
     updateUploadStatus(false);
     return;
   }
-  const [viajesRows, paradasRows, labelMap] = await Promise.all([
-    fetchAllRows('viajes'),
-    fetchAllRows('paradas'),
+
+  const cached = await cacheRead();
+  if(cached && state.vehicles.size === 0){
+    buildVehiclesFromRows(cached.viajes, cached.paradas, new Map(cached.labels));
+    state.cacheNote = 'copia local del ' + fmtFullDateTimeEs(new Date(cached.savedAt)) + ' · verificando novedades…';
+    renderDashboardFromLoadedData();
+    updateUploadStatus(false);
+  }
+
+  const [countViajes, countParadas, labelMap] = await Promise.all([
+    fetchRowCount('viajes'),
+    fetchRowCount('paradas'),
     fetchVehiculosLabelMap()
   ]);
-  buildVehiclesFromRows(viajesRows, paradasRows, labelMap);
+
+  if(countViajes === null || countParadas === null || labelMap === null){
+    // Sin conexión o error de Supabase: si hay copia local, se sigue
+    // mostrando y se avisa; si no, queda el panel vacío como antes.
+    state.cacheNote = cached
+      ? 'sin conexión con la base: mostrando la copia local del ' + fmtFullDateTimeEs(new Date(cached.savedAt))
+      : null;
+    updateUploadStatus(false);
+    return;
+  }
+
+  const labelsSig = labelMapSignature(labelMap);
+  if(cached && cached.counts.viajes === countViajes && cached.counts.paradas === countParadas){
+    if(cached.labelsSig !== labelsSig){
+      // Solo cambiaron los nombres de los vehículos: se redibuja con las
+      // mismas filas, sin volver a descargar viajes ni paradas.
+      buildVehiclesFromRows(cached.viajes, cached.paradas, labelMap);
+      renderDashboardFromLoadedData();
+      cacheWrite(Object.assign({}, cached, { labels: Array.from(labelMap.entries()), labelsSig }));
+    }
+    state.cacheNote = null; // al día: no hay nada nuevo en Supabase
+    updateUploadStatus(false);
+    return;
+  }
+
+  if(cached) state.cacheNote = 'hay datos nuevos en la base · descargando…';
+  updateUploadStatus(false);
+
+  const [resViajes, resParadas] = await Promise.all([
+    fetchAllRows('viajes', countViajes),
+    fetchAllRows('paradas', countParadas)
+  ]);
+  buildVehiclesFromRows(resViajes.rows, resParadas.rows, labelMap);
+  state.cacheNote = null;
   renderDashboardFromLoadedData();
   updateUploadStatus(false);
+
+  if(resViajes.ok && resParadas.ok){
+    cacheWrite({
+      version: CACHE_VERSION,
+      supabaseUrl: SUPABASE_URL,
+      savedAt: new Date().toISOString(),
+      counts: { viajes: countViajes, paradas: countParadas },
+      viajes: resViajes.rows,
+      paradas: resParadas.rows,
+      labels: Array.from(labelMap.entries()),
+      labelsSig
+    });
+  }
 }
 
 /* ============================================================
@@ -4749,6 +4947,9 @@ function updateUploadStatus(){
   if(state.lastUploadError){
     text += ` · ⚠ Error al guardar en Supabase: ${state.lastUploadError}`;
   }
+  if(state.cacheNote){
+    text += ` · ${state.cacheNote}`;
+  }
   els.labelUpload.textContent = text;
   els.labelUpload.title = text;
   const ready = totalVehiculos > 0;
@@ -4768,7 +4969,8 @@ els.fileUpload.addEventListener('change', function(e){
   els.dotUpload.classList.remove('ok');
   els.dotUpload.classList.add('pending');
 
-  Promise.all(files.map(f=>readWorkbook(f).then(r=>({ file:f, wb:r.wb }))))
+  ensureXLSX()
+    .then(()=>Promise.all(files.map(f=>readWorkbook(f).then(r=>({ file:f, wb:r.wb })))))
     .then(async function(results){
       const vehiculosMap = new Map();
       const viajesRows = [];
@@ -5354,8 +5556,13 @@ els.geoSearch.addEventListener('input', function(){
 });
 
 
-els.btnExport.addEventListener('click', exportSummary);
-els.btnExportPdf.addEventListener('click', exportPdfReport);
+els.btnExport.addEventListener('click', function(){
+  ensureXLSX().then(exportSummary).catch(function(err){ alert(err.message); });
+});
+els.btnExportPdf.addEventListener('click', function(){
+  try{ ensureJsPDF(); } catch(e){ console.error('Error al preparar jsPDF:', e); }
+  exportPdfReport();
+});
 
 // Al abrir el dashboard: si este mismo archivo es una "vista guardada"
 // (ver saveCurrentViewAsHtml / botón "Guardar vista"), arranca desde ahí,
@@ -5371,6 +5578,7 @@ function startApp(){
     updateUploadStatus();
     return;
   }
+  restoreLastFilters();
   updateUploadStatus();
   loadAllFromSupabaseAndRender();
 }
