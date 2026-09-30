@@ -1593,10 +1593,6 @@ const state = {
   renderedTabs: new Set(),
   allGeoZonas: [],
   allMesAnio: [],
-  // Cuando es true, la próxima vez que se calculen los meses disponibles el
-  // filtro "Mes y Año" se posiciona solo en el mes más reciente con datos.
-  // Se activa al abrir el panel y cada vez que llegan datos nuevos.
-  autoLatestMonthPending: false,
   clientesFiltro: 'todos',       // 'todos' | 'telefonica' | 'claro' | 'arsat'
   clientesMap: null,
   clientesLayer: null,
@@ -2353,20 +2349,6 @@ function activePeriod(){
       return { desde: preset.desde, hasta: preset.hasta, days };
     }
   }
-  // Con meses elegidos en "Mes y Año", los promedios por día (km/día, etc.)
-  // se calculan sobre los días de esos meses que tienen datos, no sobre el
-  // rango total cargado.
-  if(state.filters.mesAnio.size > 0 && state.dataDateRange){
-    let totalMs = 0;
-    state.filters.mesAnio.forEach(k=>{
-      const [y, m] = k.split('-').map(Number);
-      const ini = new Date(Math.max(new Date(y, m-1, 1).getTime(), state.dataDateRange.min.getTime()));
-      const fin = new Date(Math.min(new Date(y, m, 1).getTime(), state.dataDateRange.max.getTime()));
-      if(fin > ini) totalMs += fin - ini;
-    });
-    const days = totalMs/(1000*60*60*24);
-    if(days > 0) return { desde: null, hasta: null, days: Math.max(days, 1/24) };
-  }
   return { desde: null, hasta: null, days: state.periodDays };
 }
 
@@ -2599,7 +2581,7 @@ function renderKPIs(vehicles){
   const guardia = computeGuardiaTripStats(vehicles);
 
   document.getElementById('kpiKm').textContent = fmtNum(km,0) + ' km';
-  document.getElementById('kpiKmSub').textContent = `${fmtNum(km/Math.max(activePeriod().days,0.1),0)} km/día en total`;
+  document.getElementById('kpiKmSub').textContent = `${fmtNum(km/Math.max(state.periodDays,0.1),0)} km/día en total`;
   document.getElementById('kpiViajes').textContent = fmtNum(viajes,0);
   document.getElementById('kpiViajesSub').textContent = `${fmtNum(viajes/Math.max(vehicles.length,1),1)} viajes/vehículo`;
   document.getElementById('kpiVehiculos').textContent = fmtNum(vehicles.length,0);
@@ -2690,7 +2672,7 @@ function renderRegionTable(vehicles){
   });
   const rows = Array.from(byRegion.values()).map(r=>({
     region: r.region, vehiculos: r.vehiculos, km: r.km, viajes: r.viajes,
-    kmDia: r.km / activePeriod().days / Math.max(r.vehiculos,1),
+    kmDia: r.km / state.periodDays / Math.max(r.vehiculos,1),
     pctMov: (r.movMin+r.stopMin)>0 ? r.movMin/(r.movMin+r.stopMin)*100 : 0
   })).sort((a,b)=>b.km-a.km);
 
@@ -4576,31 +4558,6 @@ function computeAvailableMonths(){
   // "Limpiaron datos" y se volvió a cargar otro período), se descarta.
   const validKeys = new Set(state.allMesAnio.map(m=>m.key));
   Array.from(state.filters.mesAnio).forEach(k=>{ if(!validKeys.has(k)) state.filters.mesAnio.delete(k); });
-  // Vista por defecto: solo el último mes cargado. Se aplica al abrir el
-  // panel y cada vez que entran datos nuevos (si aparece un mes más nuevo,
-  // pasa a ser ese). Para ver más meses, se eligen en "Mes y Año" o se usa
-  // "Limpiar filtros" para ver la totalidad de los datos.
-  if(state.autoLatestMonthPending && state.allMesAnio.length > 0){
-    applyLatestMonthDefault();
-    state.autoLatestMonthPending = false;
-  }
-}
-
-function applyLatestMonthDefault(){
-  const latest = state.allMesAnio[state.allMesAnio.length - 1];
-  // Se modifica el mismo Set (sin reemplazarlo): el desplegable "Mes y Año"
-  // guarda una referencia a él y, si se reemplaza, deja de afectar al panel.
-  state.filters.mesAnio.clear();
-  state.filters.mesAnio.add(latest.key);
-  // Un período o días elegidos en una sesión anterior podrían no cruzarse
-  // con el último mes y dejar el panel vacío, así que se reinician.
-  state.filters.dias.clear();
-  state.filters.periodoTipo = 'todo';
-  state.filters.desde = null;
-  state.filters.hasta = null;
-  if(typeof markSelectedPeriodoItem === 'function') markSelectedPeriodoItem('todo');
-  const pf = document.getElementById('periodoFechas');
-  if(pf) pf.style.display = 'none';
 }
 
 // Arma los agregados y dibuja el panel a partir de lo que haya en
@@ -4794,7 +4751,6 @@ async function loadAllFromSupabaseAndRender(){
   ]);
   buildVehiclesFromRows(resViajes.rows, resParadas.rows, labelMap);
   state.cacheNote = null;
-  state.autoLatestMonthPending = true; // llegaron datos nuevos: volver al mes más reciente
   renderDashboardFromLoadedData();
   updateUploadStatus(false);
 
@@ -4888,15 +4844,11 @@ function serializeFiltersForSnapshot(){
 
 function applyFiltersFromSnapshot(f){
   if(!f) return;
-  // Se rellenan los mismos Set (sin reemplazarlos) porque cada desplegable
-  // de filtro guarda una referencia al suyo; si se reemplazaran, lo que se
-  // elige en el desplegable dejaría de aplicarse a gráficos y tablas.
-  const fill = (set, arr)=>{ set.clear(); (arr || []).forEach(k=>set.add(k)); };
-  fill(state.filters.dispositivos, f.dispositivos);
-  fill(state.filters.grupos, f.grupos);
-  fill(state.filters.geozonas, f.geozonas);
-  fill(state.filters.mesAnio, f.mesAnio);
-  fill(state.filters.dias, f.dias);
+  state.filters.dispositivos = new Set(f.dispositivos || []);
+  state.filters.grupos = new Set(f.grupos || []);
+  state.filters.geozonas = new Set(f.geozonas || []);
+  state.filters.mesAnio = new Set(f.mesAnio || []);
+  state.filters.dias = new Set(f.dias || []);
   state.filters.periodoTipo = f.periodoTipo || 'todo';
   state.filters.desde = f.desde ? new Date(f.desde) : null;
   state.filters.hasta = f.hasta ? new Date(f.hasta) : null;
@@ -5627,7 +5579,6 @@ function startApp(){
     return;
   }
   restoreLastFilters();
-  state.autoLatestMonthPending = true; // al abrir, arrancar siempre en el último mes
   updateUploadStatus();
   loadAllFromSupabaseAndRender();
 }
