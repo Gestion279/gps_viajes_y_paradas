@@ -4588,7 +4588,10 @@ function computeAvailableMonths(){
 
 function applyLatestMonthDefault(){
   const latest = state.allMesAnio[state.allMesAnio.length - 1];
-  state.filters.mesAnio = new Set([latest.key]);
+  // Se modifica el mismo Set (sin reemplazarlo): el desplegable "Mes y Año"
+  // guarda una referencia a él y, si se reemplaza, deja de afectar al panel.
+  state.filters.mesAnio.clear();
+  state.filters.mesAnio.add(latest.key);
   // Un período o días elegidos en una sesión anterior podrían no cruzarse
   // con el último mes y dejar el panel vacío, así que se reinician.
   state.filters.dias.clear();
@@ -4885,11 +4888,15 @@ function serializeFiltersForSnapshot(){
 
 function applyFiltersFromSnapshot(f){
   if(!f) return;
-  state.filters.dispositivos = new Set(f.dispositivos || []);
-  state.filters.grupos = new Set(f.grupos || []);
-  state.filters.geozonas = new Set(f.geozonas || []);
-  state.filters.mesAnio = new Set(f.mesAnio || []);
-  state.filters.dias = new Set(f.dias || []);
+  // Se rellenan los mismos Set (sin reemplazarlos) porque cada desplegable
+  // de filtro guarda una referencia al suyo; si se reemplazaran, lo que se
+  // elige en el desplegable dejaría de aplicarse a gráficos y tablas.
+  const fill = (set, arr)=>{ set.clear(); (arr || []).forEach(k=>set.add(k)); };
+  fill(state.filters.dispositivos, f.dispositivos);
+  fill(state.filters.grupos, f.grupos);
+  fill(state.filters.geozonas, f.geozonas);
+  fill(state.filters.mesAnio, f.mesAnio);
+  fill(state.filters.dias, f.dias);
   state.filters.periodoTipo = f.periodoTipo || 'todo';
   state.filters.desde = f.desde ? new Date(f.desde) : null;
   state.filters.hasta = f.hasta ? new Date(f.hasta) : null;
